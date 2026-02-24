@@ -1,0 +1,259 @@
+teachflow-sa/
+├── backend/
+│ ├── index.js
+│ ├── database.db
+│ └── package.json
+├── frontend/
+│ ├── index.html
+│ ├── src/
+│ │ ├── App.jsx
+│ │ ├── TeacherDashboard.jsx
+│ │ ├── AdminDashboard.jsx
+│ │ └── main.jsx
+│ └── package.json
+
+import express from "express";
+import cors from "cors";
+import OpenAI from "openai";
+import sqlite3 from "sqlite3";
+import fs from "fs";
+import PDFDocument from "pdfkit";
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+const openai = new OpenAI({ apiKey: "PASTE_YOUR_OPENAI_API_KEY" });
+
+// ---------------- DATABASE ----------------
+const db = new sqlite3.Database("database.db");
+
+db.run(`CREATE TABLE IF NOT EXISTS lessons (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_email TEXT,
+  grade TEXT,
+  subject TEXT,
+  topic TEXT,
+  language TEXT,
+  activity INTEGER,
+  content TEXT,
+  plan_type TEXT,
+  extra_activity INTEGER,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+)`);
+
+db.run(`CREATE TABLE IF NOT EXISTS users (
+  email TEXT PRIMARY KEY,
+  type TEXT,
+  active INTEGER
+)`);
+
+db.run(`CREATE TABLE IF NOT EXISTS schools (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT,
+  admin_email TEXT UNIQUE,
+  tier INTEGER,
+  active INTEGER DEFAULT 1
+)`);
+
+db.run(`CREATE TABLE IF NOT EXISTS teachers (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  email TEXT,
+  school_id INTEGER,
+  FOREIGN KEY (school_id) REFERENCES schools(id)
+)`);
+
+// ---------------- PAYFAST ----------------
+const PAYFAST = {
+  merchant_id: "YOUR_MERCHANT_ID",
+  merchant_key: "YOUR_MERCHANT_KEY",
+  sandbox: true
+};
+
+app.post("/pay", (req, res) => {
+  const { amount, description } = req.body;
+  const query = new URLSearchParams({
+    merchant_id: PAYFAST.merchant_id,
+    merchant_key: PAYFAST.merchant_key,
+    amount: amount.toFixed(2),
+    item_name: description,
+    return_url: "http://localhost:5173",
+    cancel_url: "http://localhost:5173"
+  }).toString();
+  const url = PAYFAST.sandbox
+    ? `https://sandbox.payfast.co.za/eng/process?${query}`
+    : `https://www.payfast.co.za/eng/process?${query}`;
+  res.json({ url });
+});
+
+// ---------------- LESSON GENERATION ----------------
+app.post("/generate", async (req, res) => {
+  const { email, grade, subject, topic, language, activity, extraActivity, planType } = req.body;
+
+  let extraText = "";
+  if (extraActivity) {
+    extraText = `
+Include an optional extra activity pack:
+- 2 additional CAPS-aligned activities
+- Memorandum for activities
+- High cognitive demand questions
+- Bloom’s taxonomy levels
+`;
+  }
+
+  const prompt = `
+Create a CAPS-aligned lesson plan (English/Afrikaans: ${language}).
+Grade: ${grade}
+Subject: ${subject}
+Topic: ${topic}
+Plan type: ${planType}
+Use template like Image 2.
+Include at least 2 high-cognitive demand questions from Image 1.
+Always include activities + memorandum.
+${extraText}
+`;
+
+  const ai = await openai.chat.completions.create({
+    model: "gpt-4o-mini",
+    messages: [{ role: "user", content: prompt }]
+  });
+
+  const content = ai.choices[0].message.content;
+
+  db.run(
+    "INSERT INTO lessons (user_email, grade, subject, topic, language, activity, content, plan_type, extra_activity) VALUES (?,?,?,?,?,?,?,?,?)",
+    [email, grade, subject, topic, language, activity ? 1 : 0, content, planType, extraActivity ? 1 : 0]
+  );
+
+  res.json({ content });
+});
+
+// ---------------- SUBSCRIPTIONS ----------------
+app.post("/subscribe", (req, res) => {
+  const { email, type } = req.body;
+  db.run("INSERT OR REPLACE INTO users (email, type, active) VALUES (?,?,1)", [email, type]);
+  res.json({ status: "active", plan: type });
+});
+
+// ---------------- SCHOOL ADMIN ----------------
+const TIER_PRICES = {1: 2500, 2: 4500, 3: 6500};
+
+app.post("/school/create", (req, res) => {
+  const { name, admin_email, tier } = req.body;
+  if (![1,2,3].includes(tier)) return res.status(400).json({ error: "Invalid tier" });
+  db.run("INSERT OR IGNORE INTO schools (name, admin_email, tier) VALUES (?,?,?)", [name, admin_email, tier]);
+  res.json({ status: "School licence active", price: `R${TIER_PRICES[tier]}/month` });
+});
+
+app.post("/school/add-teacher", (req, res) => {
+  const { email, schoolAdmin } = req.body;
+  db.get("SELECT id, tier FROM schools WHERE admin_email = ?", [schoolAdmin], (err, school) => {
+    if (!school) return res.status(404).json({ error: "School not found" });
+    db.all("SELECT COUNT(*) AS teacherCount FROM teachers WHERE school_id = ?", [school.id], (err, rows) => {
+      if (rows[0].teacherCount >= (school.tier * 10)) return res.status(400).json({ error: "Max teachers for this tier reached" });
+      db.run("INSERT INTO teachers (email, school_id) VALUES (?,?)", [email, school.id]);
+      res.json({ status: "Teacher added" });
+    });
+  });
+});
+
+// ---------------- TEACHER LESSON HISTORY & PDF ----------------
+app.get("/lessons/:email", (req, res) => {
+  db.all("SELECT * FROM lessons WHERE user_email = ? ORDER BY created_at DESC", [req.params.email], (err, rows) => res.json(rows));
+});
+
+app.post("/download-pdf", (req, res) => {
+  const { lessons } = req.body;
+  const doc = new PDFDocument();
+  const file = "lesson.pdf";
+  doc.pipe(fs.createWriteStream(file));
+  lessons.forEach((l, i) => {
+    doc.text(`Lesson ${i+1}`, { underline: true });
+    doc.moveDown();
+    doc.text(`Grade: ${l.grade}`);
+    doc.text(`Subject: ${l.subject}`);
+    doc.text(`Topic: ${l.topic}`);
+    doc.text(`Language: ${l.language}`);
+    doc.text("----------------------------------------------------");
+    doc.text(l.content);
+    doc.addPage();
+  });
+  doc.end();
+  setTimeout(() => res.download(file), 500);
+});
+
+// ---------------- SCHOOL DASHBOARD ----------------
+app.get("/school/lessons/:adminEmail", (req, res) => {
+  db.all(
+    `SELECT lessons.email, lessons.content, lessons.created_at
+     FROM lessons
+     JOIN teachers ON lessons.email = teachers.email
+     JOIN schools ON teachers.school_id = schools.id
+     WHERE schools.admin_email = ?
+     ORDER BY lessons.created_at DESC`,
+    [req.params.adminEmail],
+    (err, rows) => res.json(rows)
+  );
+});
+
+app.get("/school/compliance/:adminEmail", (req, res) => {
+  db.all(
+    `SELECT content FROM lessons
+     JOIN teachers ON lessons.email = teachers.email
+     JOIN schools ON teachers.school_id = schools.id
+     WHERE schools.admin_email = ?`,
+    [req.params.adminEmail],
+    (err, rows) => {
+      const report = rows.map(r => ({
+        WALT: r.content.includes("WALT"),
+        SC: r.content.includes("Success Criteria"),
+        Activity: r.content.includes("Activities"),
+        Memo: r.content.includes("Memorandum"),
+        HighCognitive: r.content.includes("High Cognitive"),
+        ExtraActivity: r.content.includes("Extra Activity")
+      }));
+      res.json(report);
+    }
+  );
+});
+
+app.post("/school/moderation-pdf", (req, res) => {
+  const { lessons } = req.body;
+  const doc = new PDFDocument();
+  const file = "moderation-pack.pdf";
+  doc.pipe(fs.createWriteStream(file));
+  lessons.forEach((l,i)=> {
+    doc.text(`Lesson ${i+1}`, { underline: true });
+    doc.moveDown();
+    doc.text(l.content);
+    doc.addPage();
+  });
+  doc.end();
+  setTimeout(()=>res.download(file),500);
+});
+
+app.listen(5000, () => console.log("Backend running on port 5000"));
+
+const priceMap = {
+  "pay-per-lesson": 25 + (form.activity ? 10 : 0) + (form.extraActivity ? 15 : 0),
+  "subscription": 199,
+  "school": TIER_PRICES[form.schoolTier] // Add a dropdown to select tier 1-3
+};
+
+body: JSON.stringify({ ...form, extraActivity: form.extraActivity }),
+
+{form.planType === "school" && (
+  <select name="schoolTier" onChange={handleChange}>
+    <option value={1}>Tier 1 (10 teachers)</option>
+    <option value={2}>Tier 2 (20 teachers)</option>
+    <option value={3}>Tier 3 (30 teachers)</option>
+  </select>
+)}
+
+# Backend
+cd backend
+node index.js
+
+# Frontend
+cd frontend
+npm run dev
